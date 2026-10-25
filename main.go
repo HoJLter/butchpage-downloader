@@ -3,91 +3,68 @@ package main
 import (
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-type HttpResult struct {
-	url  string
-	body io.ReadCloser
-	err  error
-}
-
 var httpClient = http.Client{
 	Timeout: 5 * time.Second,
 }
 
-const workersCount = 5
+const workersCount = 30
 
-func httpGetWorker(wg *sync.WaitGroup, url string, resCh chan<- HttpResult, semaphore chan struct{}) {
+func httpToFileWorker(
+	wg *sync.WaitGroup,
+	url string,
+	outputPath string,
+	semaphore chan struct{}) {
+
 	defer wg.Done()
 	defer func() { <-semaphore }()
 	semaphore <- struct{}{}
 
-	slog.Debug("HttpGet function called", "target", url)
+	slog.Debug("httpToFile function called", "target", url)
 
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		resCh <- HttpResult{url, nil, err}
+		slog.Error(err.Error())
 		return
 	}
-	resCh <- HttpResult{url, resp.Body, nil}
-}
+	defer resp.Body.Close()
 
-func writeToFileWorker(
-	path string,
-	wg *sync.WaitGroup,
-	body io.ReadCloser,
-) {
-	defer wg.Done()
-	defer body.Close()
-	slog.Debug("Writing", "path", path)
-
-	outputFile, err := os.OpenFile(
-		path,
-		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-		0644,
-	)
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		slog.Error(err.Error())
 		return
 	}
-	defer outputFile.Close()
+	defer file.Close()
 
-	data, err := io.ReadAll(body)
-	if err != nil {
-		slog.Error(err.Error())
-		return
-	}
-
-	_, err = outputFile.Write(data)
+	_, err = io.Copy(file, resp.Body)
 	if err != nil {
 		slog.Error(err.Error())
 		return
 	}
 }
 
-func getDomain(url string) (string, error) {
-	regex, err := regexp.Compile("[a-zA-Z]+")
+func getDomain(rawUrl string) (string, error) {
+	u, err := url.Parse(rawUrl)
 	if err != nil {
 		slog.Error(err.Error())
 		return "", err
 	}
-	domain := regex.FindAllString(url, 2)[1]
-	return domain, nil
+	return u.Hostname(), nil
 }
 
 func configureLogger() {
 	opts := slog.HandlerOptions{
-		AddSource: true,
-		Level:     slog.LevelDebug,
+		AddSource: false,
+		Level:     slog.LevelError,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &opts))
 	slog.SetDefault(logger)
@@ -120,42 +97,23 @@ func main() {
 		return
 	}
 	endpoints := strings.Split(string(input), ";")
-	fmt.Println(endpoints)
 
 	wg := sync.WaitGroup{}
-	jobsChan := make(chan string, len(endpoints))
-	for _, endpoint := range endpoints {
-		jobsChan <- endpoint
-	}
-	close(jobsChan)
-
-	resCh := make(chan HttpResult, len(endpoints))
 	semaphore := make(chan struct{}, workersCount)
 
-	for job := range jobsChan {
-		wg.Add(1)
-		go httpGetWorker(&wg, job, resCh, semaphore)
-	}
-	wg.Wait()
-	close(resCh)
-
-	for res := range resCh {
-		if res.err != nil {
-			slog.Error(res.err.Error())
-			continue
-		}
-
-		domain, err := getDomain(res.url)
+	for _, url := range endpoints {
+		domain, err := getDomain(url)
 		if err != nil {
 			slog.Error(err.Error())
 			continue
 		}
-		wg.Add(1)
 
-		go writeToFileWorker(
-			*outputDir+"/"+domain+".html",
+		wg.Add(1)
+		go httpToFileWorker(
 			&wg,
-			res.body,
+			url,
+			*outputDir+"/"+domain+".html",
+			semaphore,
 		)
 	}
 	wg.Wait()
