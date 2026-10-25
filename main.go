@@ -16,7 +16,7 @@ import (
 
 type HttpResult struct {
 	url  string
-	data []byte
+	body io.ReadCloser
 	err  error
 }
 
@@ -24,8 +24,13 @@ var httpClient = http.Client{
 	Timeout: 5 * time.Second,
 }
 
-func httpGetWorker(wg *sync.WaitGroup, url string, resCh chan<- HttpResult) {
+const workersCount = 5
+
+func httpGetWorker(wg *sync.WaitGroup, url string, resCh chan<- HttpResult, semaphore chan struct{}) {
 	defer wg.Done()
+	defer func() { <-semaphore }()
+	semaphore <- struct{}{}
+
 	slog.Debug("HttpGet function called", "target", url)
 
 	resp, err := httpClient.Get(url)
@@ -33,35 +38,38 @@ func httpGetWorker(wg *sync.WaitGroup, url string, resCh chan<- HttpResult) {
 		resCh <- HttpResult{url, nil, err}
 		return
 	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		resCh <- HttpResult{url, nil, err}
-		return
-	}
-	resCh <- HttpResult{url, data, nil}
+	resCh <- HttpResult{url, resp.Body, nil}
 }
 
 func writeToFileWorker(
 	path string,
 	wg *sync.WaitGroup,
-	data []byte,
+	body io.ReadCloser,
 ) {
 	defer wg.Done()
+	defer body.Close()
 	slog.Debug("Writing", "path", path)
+
 	outputFile, err := os.OpenFile(
 		path,
-		os.O_WRONLY|os.O_CREATE,
+		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
 		0644,
 	)
 	if err != nil {
+		slog.Error(err.Error())
 		return
 	}
 	defer outputFile.Close()
 
+	data, err := io.ReadAll(body)
+	if err != nil {
+		slog.Error(err.Error())
+		return
+	}
+
 	_, err = outputFile.Write(data)
 	if err != nil {
+		slog.Error(err.Error())
 		return
 	}
 }
@@ -91,7 +99,9 @@ func main() {
 	inputFilename := flag.String("i", "input.txt", "input filename")
 	outputDir := flag.String("o", "out", "out directory")
 
-	err := os.Mkdir(*outputDir, 0644)
+	flag.Parse()
+
+	err := os.Mkdir(*outputDir, 0755)
 	if err != nil && !errors.Is(err, os.ErrExist) {
 		slog.Error(err.Error())
 		return
@@ -120,9 +130,11 @@ func main() {
 	close(jobsChan)
 
 	resCh := make(chan HttpResult, len(endpoints))
+	semaphore := make(chan struct{}, workersCount)
+
 	for job := range jobsChan {
 		wg.Add(1)
-		go httpGetWorker(&wg, job, resCh)
+		go httpGetWorker(&wg, job, resCh, semaphore)
 	}
 	wg.Wait()
 	close(resCh)
@@ -139,10 +151,11 @@ func main() {
 			continue
 		}
 		wg.Add(1)
+
 		go writeToFileWorker(
 			*outputDir+"/"+domain+".html",
 			&wg,
-			res.data,
+			res.body,
 		)
 	}
 	wg.Wait()
