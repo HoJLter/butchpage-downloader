@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type HttpResult struct {
@@ -19,11 +20,15 @@ type HttpResult struct {
 	err  error
 }
 
+var httpClient = http.Client{
+	Timeout: 5 * time.Second,
+}
+
 func httpGetWorker(wg *sync.WaitGroup, url string, resCh chan<- HttpResult) {
 	defer wg.Done()
 	slog.Debug("HttpGet function called", "target", url)
 
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		resCh <- HttpResult{url, nil, err}
 		return
@@ -42,25 +47,23 @@ func writeToFileWorker(
 	path string,
 	wg *sync.WaitGroup,
 	data []byte,
-	errCh chan<- error,
 ) {
 	defer wg.Done()
+	slog.Debug("Writing", "path", path)
 	outputFile, err := os.OpenFile(
 		path,
 		os.O_WRONLY|os.O_CREATE,
 		0644,
 	)
 	if err != nil {
-		errCh <- err
+		return
 	}
 	defer outputFile.Close()
 
 	_, err = outputFile.Write(data)
 	if err != nil {
-		errCh <- err
+		return
 	}
-
-	errCh <- nil
 }
 
 func getDomain(url string) (string, error) {
@@ -124,10 +127,9 @@ func main() {
 	wg.Wait()
 	close(resCh)
 
-	writeErrCh := make(chan error, len(endpoints))
 	for res := range resCh {
 		if res.err != nil {
-			slog.Error(err.Error())
+			slog.Error(res.err.Error())
 			continue
 		}
 
@@ -136,13 +138,12 @@ func main() {
 			slog.Error(err.Error())
 			continue
 		}
+		wg.Add(1)
 		go writeToFileWorker(
-			*outputDir+domain+".html",
+			*outputDir+"/"+domain+".html",
 			&wg,
 			res.data,
-			writeErrCh,
 		)
-
 	}
-
+	wg.Wait()
 }
